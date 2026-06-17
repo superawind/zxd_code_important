@@ -1,0 +1,6 @@
+01_llm_releate/01_train_llm/dpo-1-epoch/
+01_llm_releate/01_train_llm/saves/
+01_llm_releate/data/pretrain.jsonl
+01_llm_releate/data/sft_1024.jsonl
+01_llm_releate/save_models/
+
