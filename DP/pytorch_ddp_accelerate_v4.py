@@ -1,0 +1,216 @@
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import os
+import math
+import time
+import pandas as pd
+
+from torch.optim import Adam
+from accelerate import Accelerator
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+from torch.utils.data import random_split
+from peft import LoraConfig, get_peft_model
+
+
+"""
+# 启动方式一 ：torchrun --nproc_per_node=2 pytorch_ddp_accelerate.py ， 没有accelerate 启动 兼容的方式多
+# 启动方式二： accelerate launch pytorch_ddp_accelerate.py 最基础的方式
+    可以通过终端输入 accelerate config 开始配置启动配置文件
+    accelerate launch --help 查看参数提示信息
+
+
+1、不需要手动初始化进程组，dist.init_progress_group()， accelerate 初始化对象的时候会执行这句
+2、DataLoader 的构造，和单卡一样，采用shuffle就行，不需要采用 DistributedSampler
+3、不需要手动将模型等移动到某个设备上，普通初始化模型和 optim 就行
+
+# 混合精度训练方式，保存加载方式
+混合精度训练不一定会减少显存（主要区别在激活值大小，当激活较大时会减少，否则不一定），但是一定会加速训练，
+
+# 4、混合精度训练开启方式，
+    4.1、accelerator = Accelerator(mixed_precision='bf16')
+    4.2、终端输入命令 accelerate config， 配置 config ， 然后在跑训练命令
+    4.3、命令行启动时传入参数 accelerate launch --mixed_precision bf16 ddp_accelerate.py
+
+# 5、梯度累积 accelerate 实现
+    5.1、第一步，需要指定梯度累计步数  accelerator = Accelerator(gradient_accumulation_steps=2)
+    5.2、第二步，指定上下文，在训练的 trainloader 中指定，注意需要传入 model
+
+# 6、模型保存
+    # 6.1、单机训练 model.save_pretrained(save_path)，分布式直接调用会报错，因为包装了，同时 不是所有进程都保存
+    # 方式一、accelerator.save_model(model, save_path) 注意，这样只保存 参数，不保存配置文件，配置文件只有save_pretrained 会保存， 同时这样保存，如果模型是Peft ，也不会对peft部分单独保存，所有参数adapt 和 主体都在一个 safetensors 中，accelerator.save_model 没有给解包，我们可以采用方式二，手动自己解包保存
+    # 方式二、accelerator.unwrap_model(model).save_pretrained(save_directory='/mnt/code/zhaoxudong03/Train/Study/DP/checkpoints' + f"step_{global_step}", is_main_process=accelerator.is_main_process, state_dict=accelerator.get_state_dict(model), save_func=accelerator.save)
+
+# 7、断点续训
+    # 第一步，保存检查点
+        accelerator.save_state()
+
+    # 第二步,加载检查点 
+        accelerator.load_state()
+
+    # 第三步，计算跳过轮数和步数
+        resume_epoch, resume_step
+
+    # 第四步，数据集跳过对应部署
+        accelerator.skip_first_batches(trainloader, resume_step)
+
+"""
+
+class MyDataset(Dataset):
+    def __init__(self) -> None:
+        super().__init__()
+        self.data = pd.read_csv("/mnt//code/zhaoxudong03/Train/Study/DP/ChnSentiCorp_htl_all.csv")
+        self.data = self.data.dropna()
+
+    def __getitem__(self, index):
+        return self.data.iloc[index]["review"], self.data.iloc[index]["label"]
+    
+    def __len__(self):
+        return len(self.data)
+
+def prepare_dataloader():
+    dataset = MyDataset()
+
+    # 保证不同进程间的 数据集划分 一样，不同进程间不存在训练集和验证集交叉的问题， 设置 generator=torch.Generator().manual_seed(12)
+    trainset, validset = random_split(dataset, lengths=[0.9, 0.1], generator=torch.Generator().manual_seed(42))
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    def collate_func(batch):
+        # batch 中每一个元素。是 dataset.getitem() 的一条返回结果
+        texts, labels = [], []
+        # print(len(batch), len(batch[0]))
+        # print('========================================')
+        # print(batch)
+        for item in batch:
+            texts.append(item[0])
+            labels.append(item[1])
+        inputs = tokenizer(texts, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
+        inputs["labels"] = torch.tensor(labels)
+        return inputs
+
+    # step1
+    trainloader = DataLoader(trainset, batch_size=8, collate_fn=collate_func, shuffle=True)
+    validloader = DataLoader(validset, batch_size=64, collate_fn=collate_func, shuffle=False)
+
+    return trainloader, validloader
+
+def prepare_model_and_optimizer():
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    lora_config = LoraConfig(target_modules=["q_proj","v_proj"])
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    optimizer = Adam(model.parameters(), lr=2e-5)
+
+    return model, optimizer
+
+
+def evaluate(model, validloader, accelerator: Accelerator):
+    model.eval()
+    acc_num = 0
+    with torch.inference_mode():
+        for batch in validloader:
+            output = model(**batch)
+            pred = torch.argmax(output.logits, dim=-1)
+            # 这一步 accelerate 会自动进行 汇总聚合，不需要手动汇总，这一步解决了之前 ddp 的一个问题，验证数据，batch_size = 64，数据集不够平均划分的时候，ddp 那种会自动填充到 64个，会导致acc 有点虚高，甚至超过 1, 采用 accelerator.gather_for_metric()可以解决这个问题。最后一个batch size 是实际大小
+            preds, refs = accelerator.gather_for_metrics((pred, batch['labels']))
+            acc_num += (preds.long() == refs.long()).float().sum()
+
+    return acc_num / len(validloader.dataset)
+
+# 也不需要自己定义 rank 0 打印
+def print_rank_0(info):
+    if int(os.environ['RANK']) == 0:
+        print(info)
+
+def train(model, optimizer, trainloader, validloader, accelerator:Accelerator, resume, epoch=3, log_step=10):
+    global_step = 0
+
+    resume_epoch = 0
+    resume_step = 0
+
+    # 判断是否需要加载checkpoint
+    if resume is not None:
+        accelerator.load_state(resume)
+        # 计算每个epoch 需要多少 step 
+        steps_per_epoch = math.ceil(len(trainloader) / accelerator.gradient_accumulation_steps) 
+        accelerator.print(steps_per_epoch)  
+        # 从保存路径，获取当前保存的 step
+        resume_step = global_step =  int(resume.split('step_')[-1])
+        accelerator.print(resume_step)  # 能整除的话，应该是 global_steps * gradient_accumulation_steps
+        # 计算已经训练多少个 epoch 
+        resume_epoch = resume_step // steps_per_epoch
+        accelerator.print(resume_epoch)  # 能整除的话，应该是 global_steps * gradient_accumulation_steps
+        # 获取最近一个 epoch 训练了多少 step
+        resume_step -= resume_epoch * steps_per_epoch
+        accelerator.print(resume_step)  # 能整除的话，应该是 global_steps * gradient_accumulation_steps
+
+
+
+    for ep in range(resume_epoch, epoch):
+        model.train()
+        # 跳过相应的数据
+        if resume and ep == resume_epoch and resume_step != 0:
+            activate_loader = accelerator.skip_first_batches(trainloader, resume_step * accelerator.gradient_accumulation_steps)
+        else:
+            activate_loader = trainloader
+
+        # for batch in trainloader:
+        for batch in activate_loader:
+            # 梯度累计第二步骤
+            with accelerator.accumulate(model):
+                optimizer.zero_grad()
+                output = model(**batch)
+                loss = output.loss
+                accelerator.backward(loss)
+                optimizer.step()
+                # 将 global_step 与 梯度累积 次数统一，确定每一次global_step+1 的时候都是更新参数的时候，而不是每一次前向反向传播之后
+                if accelerator.sync_gradients: # 如果做了一次梯度同步，等价于更新了一次，才进行打印
+                    global_step += 1
+                    if global_step % log_step == 0:
+                        loss = accelerator.reduce(loss, 'mean')
+                        accelerator.print(f"ep: {ep}, global_step: {global_step}, loss: {loss.item()}")
+
+                    if global_step % 50 == 0 and global_step != 0:
+                        # 存储状态，为后续断点训练
+                        accelerator.save_state(os.path.join('/mnt/code/zhaoxudong03/Train/Study/DP/checkpoints/', f"step_{global_step}"))
+                        # accelerator.save_state(accelerator.project_dir+ f"step_{global_step}")
+                        # accelerator.save_model(model, '/mnt/code/zhaoxudong03/Train/Study/DP/checkpoints' + f"step_{global_step}")
+                        accelerator.unwrap_model(model).save_pretrained(
+                            # save_directory=accelerator.project_dir + f"step_{global_step}/model", 
+                            save_directory=os.path.join('/mnt/code/zhaoxudong03/Train/Study/DP/checkpoints/' , f"step_{global_step}/model"), 
+                            is_main_process=accelerator.is_main_process, 
+                            state_dict=accelerator.get_state_dict(model), 
+                            save_func=accelerator.save
+                        )
+
+
+                # if global_step % log_step == 0:
+                #     loss = accelerator.reduce(loss, 'mean')
+                #     accelerator.print(f"ep: {ep}, global_step: {global_step}, loss: {loss.item()}")
+                # global_step += 1
+        acc = evaluate(model, validloader, accelerator)
+        # print(f"ep: {ep}, acc: {acc}, time: {time.time() - start}")
+        accelerator.print(f"ep: {ep}, acc: {acc} ")
+
+def main():
+    # accelerator = Accelerator()
+    # accelerator = Accelerator(mixed_precision='bf16')
+    accelerator = Accelerator(gradient_accumulation_steps=2)
+
+    trainloader, validloader = prepare_dataloader()
+    model, optimizer = prepare_model_and_optimizer()
+
+    model, optimizer, trainloader, validloader = accelerator.prepare(model, optimizer, trainloader, validloader)
+    # train(model, optimizer, trainloader, validloader, accelerator, resume = None)  # 第一次没有 resume
+    train(model, optimizer, trainloader, validloader, accelerator, resume = '/mnt/code/zhaoxudong03/Train/Study/DP/checkpoints/step_150')  # 第二次有 resume
+
+if __name__ == '__main__':
+    model_path = '/opt/users/Qwen3-0.6B/Qwen/Qwen3-0.6B'
+
+    main()
